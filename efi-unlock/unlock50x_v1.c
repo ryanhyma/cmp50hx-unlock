@@ -4271,44 +4271,55 @@ static UINTN discover_cmp50(CMP50_BDF *found, UINTN cap)
     return n;
 }
 
-static BOOLEAN parse_selected_bdf(EFI_HANDLE IH, CMP50_BDF *out)
+static INTN bdf_hex_digit(CHAR16 c)
+{
+    if (c >= L'0' && c <= L'9') return c - L'0';
+    c |= 0x20;
+    if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+    return -1;
+}
+
+/* 0 = option absent, 1 = one valid option, -1 = malformed or duplicated. */
+static INTN parse_selected_bdf(EFI_HANDLE IH, CMP50_BDF *out)
 {
     EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
     const CHAR16 *o;
-    UINTN i, chars;
+    UINTN i, chars, start, len;
+    INTN result = 0;
     if (!IH || EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, IH,
             &u40x_li_guid, (VOID **)&li)) || !li || !li->LoadOptions)
-        return FALSE;
+        return 0;
     o = (const CHAR16 *)li->LoadOptions;
     chars = li->LoadOptionsSize / sizeof(CHAR16);
-    for (i = 0; i + 12 < chars; i++) {
-        UINT32 b, d, f;
-        CHAR16 c;
-        if (o[i] != L'-' || o[i+1] != L'-' || o[i+2] != L'b' ||
-            o[i+3] != L'd' || o[i+4] != L'f' || o[i+5] != L'=' ||
-            o[i+8] != L':' || o[i+11] != L'.' ||
-            o[i+12] < L'0' || o[i+12] > L'7') continue;
-        c=o[i+6]; if(c>=L'0'&&c<=L'9') b=c-L'0';
-        else if((c|0x20)>=L'a'&&(c|0x20)<=L'f') b=(c|0x20)-L'a'+10;
-        else continue;
-        c=o[i+7]; if(c>=L'0'&&c<=L'9') b=b*16+c-L'0';
-        else if((c|0x20)>=L'a'&&(c|0x20)<=L'f') b=b*16+(c|0x20)-L'a'+10;
-        else continue;
-        c=o[i+9]; if(c>=L'0'&&c<=L'9') d=c-L'0';
-        else if((c|0x20)>=L'a'&&(c|0x20)<=L'f') d=(c|0x20)-L'a'+10;
-        else continue;
-        c=o[i+10]; if(c>=L'0'&&c<=L'9') d=d*16+c-L'0';
-        else if((c|0x20)>=L'a'&&(c|0x20)<=L'f') d=d*16+(c|0x20)-L'a'+10;
-        else continue;
-        f = o[i+12]-L'0';
-        if (i + 13 < chars) {
-            c = o[i+13];
-            if (c && c != L' ' && c != L'\t' && c != L'\r' && c != L'\n') continue;
+    for (i = 0; i < chars && o[i];) {
+        while (i < chars && o[i] && (o[i] == L' ' || o[i] == L'\t' ||
+               o[i] == L'\r' || o[i] == L'\n')) i++;
+        start = i;
+        while (i < chars && o[i] && o[i] != L' ' && o[i] != L'\t' &&
+               o[i] != L'\r' && o[i] != L'\n') i++;
+        len = i - start;
+        if (len < 5 || o[start] != L'-' || o[start+1] != L'-' ||
+            (o[start+2] | 0x20) != L'b' ||
+            (o[start+3] | 0x20) != L'd' ||
+            (o[start+4] | 0x20) != L'f')
+            continue;
+        if (result || len != 13 || o[start+5] != L'=' ||
+            o[start+8] != L':' || o[start+11] != L'.' ||
+            o[start+12] < L'0' || o[start+12] > L'7')
+            return -1;
+        {
+            INTN b0 = bdf_hex_digit(o[start+6]);
+            INTN b1 = bdf_hex_digit(o[start+7]);
+            INTN d0 = bdf_hex_digit(o[start+9]);
+            INTN d1 = bdf_hex_digit(o[start+10]);
+            if (b0 < 0 || b1 < 0 || d0 < 0 || d1 < 0) return -1;
+            out->bus = (UINT8)(b0 * 16 + b1);
+            out->dev = (UINT8)(d0 * 16 + d1);
+            out->fn = (UINT8)(o[start+12] - L'0');
         }
-        out->bus = b; out->dev = d; out->fn = f;
-        return TRUE;
+        result = 1;
     }
-    return FALSE;
+    return result;
 }
 
 /* BAR0 decode + command|=MEMORY|BUS_MASTER（黑盒 prepare_pci_resources 简化版） */
@@ -4575,7 +4586,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     EFI_STATUS Status = EFI_SUCCESS;
     BOOLEAN returnToGrub;
     BOOLEAN discoveryOnly;
-    BOOLEAN explicitBdf;
+    INTN bdfOption;
     CMP50_BDF found[CMP50_MAX_FOUND], selected;
     UINTN foundCount, cardIndex;
     UINT64 v67Phys = 0, v67LowPhys = 0;
@@ -4609,7 +4620,11 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     Print(L"\n=== CMP50HX Unlock v1-50HX (TU102 GSP WITH_LOADER) ===\n");
     returnToGrub = u40x_has_load_option(ImageHandle, L"--return-to-grub");
     discoveryOnly = u40x_has_load_option(ImageHandle, L"--discover-only");
-    explicitBdf = parse_selected_bdf(ImageHandle, &selected);
+    bdfOption = parse_selected_bdf(ImageHandle, &selected);
+    if (bdfOption < 0) {
+        Print(L"[50HX] malformed or repeated --bdf option; refusing to select a default GPU\n");
+        return EFI_INVALID_PARAMETER;
+    }
     if (returnToGrub)
         Print(L"[50HX] GRUB handoff mode: internal chainload disabled\n");
     foundCount = discover_cmp50(found, CMP50_MAX_FOUND);
@@ -4624,6 +4639,8 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
             preload_os_loader(ImageHandle);
             Status = chainload_preloaded(ImageHandle);
             Print(L"[50HX] discovery-only chainload result: %r\n", Status);
+            if (EFI_ERROR(Status))
+                return Status;
         }
         return EFI_SUCCESS;
     }
@@ -4635,7 +4652,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         preload_os_loader(ImageHandle);
 
     /* ---------- [1] 找卡（黑盒 fast-probe + 有界） ---------- */
-    if (explicitBdf) {
+    if (bdfOption == 1) {
         for (cardIndex = 0; cardIndex < foundCount; cardIndex++)
             if (found[cardIndex].bus == selected.bus &&
                 found[cardIndex].dev == selected.dev &&

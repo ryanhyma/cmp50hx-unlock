@@ -11,6 +11,11 @@ single-card unlock path for one discovered card; a BDF that is absent or has a
 different device ID is rejected before BAR/MMIO writes. P104-100 devices
 (`10de:1b87`) are never selected.
 
+A malformed or repeated `--bdf` option is rejected with
+`EFI_INVALID_PARAMETER`; it cannot fall back to the default card. If the
+discovery-only chainload fails, its EFI error status is returned to firmware
+after it is logged.
+
 This is a discovery and explicit single-card selection change. Sequential
 multi-card unlock is intentionally not enabled yet: the current source does
 not provide a proven per-card cleanup boundary, and reusing the large unlock
