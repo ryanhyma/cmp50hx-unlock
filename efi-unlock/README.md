@@ -1,5 +1,9 @@
 # CMP 50HX UEFI compute unlock (efi-unlock)
 
+Multi-GPU discovery, explicit single-card selection, state lifecycle review,
+and the current sequential-unlock limitation are documented in
+[`MULTI-GPU.md`](MULTI-GPU.md).
+
 A pre-OS UEFI application that unlocks the CMP 50HX (TU102, `10de:1e09`)
 compute path — SS0/SS1 full speed — before the operating system boots.
 **No kernel patches, no driver modifications, no flashing**: the unlock runs
@@ -325,8 +329,9 @@ itself never survives a GPU reset anyway).
   adoption sticks and GSP keeps it (verified on an X79 host: 2.5→5.0
   GT/s, H2D 0.80→1.59 GB/s). The unlock itself is kernel patch 04 +
   `cmp50hx-gen2.service` (Linux) or the Windows logon task.
-- One card per run: the application unlocks the first `10de:1e09` it
-  finds; multi-GPU hosts need an iteration loop (not yet ported).
+- Multi-GPU discovery and explicit single-card selection are available via
+  `--discover-only` and `--bdf=BB:DD.F`; sequential unlocking is not yet
+  implemented. See [`MULTI-GPU.md`](MULTI-GPU.md) before testing multiple cards.
 - Windows: covered by [`../efi-unlock-windows/`](../efi-unlock-windows/README.md),
   which uses the same EFI binary plus a Go installer that deploys it
   to `\EFI\50HX\50HXUNLK.EFI`, creates the boot entry, sets `BootOrder`

@@ -24,6 +24,8 @@
  *     from a loaded app hard-hangs whole firmware families.
  *   - optional --return-to-grub load option skips that ladder and returns
  *     EFI_SUCCESS to the caller, allowing GRUB to chainload the OS next.
+ *   - --discover-only enumerates CMP 50HX devices without PCI/MMIO writes;
+ *   - --bdf=BB:DD.F selects one discovered CMP 50HX explicitly.
  *
  * Unlock protocol is unchanged (ported from open-gpu-kernel-modules
  * 610.43.03 init flow, proved on hardware by the 40HX project):
@@ -1019,6 +1021,18 @@ alloc_below_4g(UINTN Pages, EFI_PHYSICAL_ADDRESS *Phys)
     return uefi_call_wrapper(BS->AllocatePages, 4, AllocateMaxAddress,
                              EfiReservedMemoryType, Pages, Phys);
 }
+
+/* A per-run state audit for multi-card work: gRb, gBus/gDev/gFn and
+ * gBar0Base identify the active card and must be rebound before every run;
+ * g_fbSize/g_frtsOffset/g_wpr2LoUp/g_wpr2HiUp and the pre-kill WPR2 pair
+ * are card firmware state and must be reset/re-detected for every card.
+ * cmp90_next_high_slot is allocator state shared by all payload allocations;
+ * cmp90_metaLowPhys caches a single low page; g_ryzenApu and the root bridge
+ * array describe host topology and may be shared. Payload addresses in
+ * efi_main are local, but AllocatePages keeps their pages reserved until
+ * explicitly freed or EFI exit. Logging and chainload buffers are app-wide.
+ * These lifetimes are why discovery/selection is separated from writes and
+ * why a multi-card unlock loop needs per-card cleanup before it is enabled. */
 
 /* v2.62: буфер FWSEC ВЫШЕ 4ГБ — драйвер грузит с 0x110BB0000 (>4GB,
  * memdesc NV_MEMORY_CACHED). Наш ниже-4ГБ (0x7FB15000) — единственное
@@ -4229,6 +4243,74 @@ diag_done: ;
     return 0;
 }
 
+#define CMP50_MAX_FOUND 64
+typedef struct { UINT8 bus, dev, fn; } CMP50_BDF;
+
+/* Discovery uses read-only CF8/CFC config reads, the same path already used
+ * by the proven single-card probe. It never enables BARs or writes registers. */
+static UINTN discover_cmp50(CMP50_BDF *found, UINTN cap)
+{
+    UINTN b, d, f, n = 0;
+    for (b = 0; b < 256; b++) for (d = 0; d < 32; d++) {
+        UINT32 id0 = u40x_pci_rbdf(b, d, 0, 0, 2);
+        UINT32 hdr;
+        UINTN maxf;
+        if (id0 == 0xFFFFFFFFu || (id0 & 0xFFFFu) == 0) continue;
+        hdr = u40x_pci_rbdf(b, d, 0, 0x0C, 2);
+        maxf = (hdr & 0x800000u) ? 8 : 1;
+        for (f = 0; f < maxf; f++) {
+            UINT32 id = f ? u40x_pci_rbdf(b, d, f, 0, 2) : id0;
+            if ((id & 0xFFFFu) != 0x10DEu || (id >> 16) != 0x1E09u)
+                continue;
+            Print(L"[50HX] discovery CMP 50HX %02x:%02x.%x 10de:1e09\n",
+                  (UINT32)b, (UINT32)d, (UINT32)f);
+            if (n < cap) { found[n].bus = b; found[n].dev = d; found[n].fn = f; }
+            n++;
+        }
+    }
+    return n;
+}
+
+static BOOLEAN parse_selected_bdf(EFI_HANDLE IH, CMP50_BDF *out)
+{
+    EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
+    const CHAR16 *o;
+    UINTN i, chars;
+    if (!IH || EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, IH,
+            &u40x_li_guid, (VOID **)&li)) || !li || !li->LoadOptions)
+        return FALSE;
+    o = (const CHAR16 *)li->LoadOptions;
+    chars = li->LoadOptionsSize / sizeof(CHAR16);
+    for (i = 0; i + 12 < chars; i++) {
+        UINT32 b, d, f;
+        CHAR16 c;
+        if (o[i] != L'-' || o[i+1] != L'-' || o[i+2] != L'b' ||
+            o[i+3] != L'd' || o[i+4] != L'f' || o[i+5] != L'=' ||
+            o[i+8] != L':' || o[i+11] != L'.' ||
+            o[i+12] < L'0' || o[i+12] > L'7') continue;
+        c=o[i+6]; if(c>=L'0'&&c<=L'9') b=c-L'0';
+        else if((c|0x20)>=L'a'&&(c|0x20)<=L'f') b=(c|0x20)-L'a'+10;
+        else continue;
+        c=o[i+7]; if(c>=L'0'&&c<=L'9') b=b*16+c-L'0';
+        else if((c|0x20)>=L'a'&&(c|0x20)<=L'f') b=b*16+(c|0x20)-L'a'+10;
+        else continue;
+        c=o[i+9]; if(c>=L'0'&&c<=L'9') d=c-L'0';
+        else if((c|0x20)>=L'a'&&(c|0x20)<=L'f') d=(c|0x20)-L'a'+10;
+        else continue;
+        c=o[i+10]; if(c>=L'0'&&c<=L'9') d=d*16+c-L'0';
+        else if((c|0x20)>=L'a'&&(c|0x20)<=L'f') d=d*16+(c|0x20)-L'a'+10;
+        else continue;
+        f = o[i+12]-L'0';
+        if (i + 13 < chars) {
+            c = o[i+13];
+            if (c && c != L' ' && c != L'\t' && c != L'\r' && c != L'\n') continue;
+        }
+        out->bus = b; out->dev = d; out->fn = f;
+        return TRUE;
+    }
+    return FALSE;
+}
+
 /* BAR0 decode + command|=MEMORY|BUS_MASTER（黑盒 prepare_pci_resources 简化版） */
 static int u40x_enable_bar(void)
 {
@@ -4492,6 +4574,10 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 {
     EFI_STATUS Status = EFI_SUCCESS;
     BOOLEAN returnToGrub;
+    BOOLEAN discoveryOnly;
+    BOOLEAN explicitBdf;
+    CMP50_BDF found[CMP50_MAX_FOUND], selected;
+    UINTN foundCount, cardIndex;
     UINT64 v67Phys = 0, v67LowPhys = 0;
     UINT64 ucodePhys = 0, blPhys = 0;
     UINT64 radixPhys = 0, radixTabPhys = 0, radixSize = 0;
@@ -4522,9 +4608,26 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     u40x_open_log(ImageHandle);
     Print(L"\n=== CMP50HX Unlock v1-50HX (TU102 GSP WITH_LOADER) ===\n");
     returnToGrub = u40x_has_load_option(ImageHandle, L"--return-to-grub");
+    discoveryOnly = u40x_has_load_option(ImageHandle, L"--discover-only");
+    explicitBdf = parse_selected_bdf(ImageHandle, &selected);
     if (returnToGrub)
         Print(L"[50HX] GRUB handoff mode: internal chainload disabled\n");
-    else
+    foundCount = discover_cmp50(found, CMP50_MAX_FOUND);
+    if (foundCount > CMP50_MAX_FOUND) {
+        Print(L"[50HX] discovery capacity exceeded (%d); refusing writes\n", (INTN)foundCount);
+        return EFI_OUT_OF_RESOURCES;
+    }
+    Print(L"[50HX] discovery complete: %d CMP 50HX card(s)\n", (INTN)foundCount);
+    if (discoveryOnly) {
+        Print(L"[50HX] discovery-only: no PCI or GPU firmware writes performed\n");
+        if (!returnToGrub) {
+            preload_os_loader(ImageHandle);
+            Status = chainload_preloaded(ImageHandle);
+            Print(L"[50HX] discovery-only chainload result: %r\n", Status);
+        }
+        return EFI_SUCCESS;
+    }
+    if (!returnToGrub)
         /* Read the OS loader into RAM BEFORE the unlock: the SFS fallback in
          * chainload_preloaded() hangs on some AMI firmwares, so this is the
          * path that must succeed. The call was lost when the 90HX branch was
@@ -4532,7 +4635,21 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         preload_os_loader(ImageHandle);
 
     /* ---------- [1] 找卡（黑盒 fast-probe + 有界） ---------- */
-    if (!u40x_find_gpu()) {
+    if (explicitBdf) {
+        for (cardIndex = 0; cardIndex < foundCount; cardIndex++)
+            if (found[cardIndex].bus == selected.bus &&
+                found[cardIndex].dev == selected.dev &&
+                found[cardIndex].fn == selected.fn) break;
+        if (cardIndex == foundCount) {
+            Print(L"[50HX] selected BDF %02x:%02x.%x is not a CMP 50HX; abort\n",
+                  (UINT32)selected.bus, (UINT32)selected.dev, (UINT32)selected.fn);
+            return returnToGrub ? EFI_SUCCESS : EFI_NOT_FOUND;
+        }
+        gBus = selected.bus; gDev = selected.dev; gFn = selected.fn;
+        u40x_enc_found = 2;
+        Print(L"[50HX] explicit selection %02x:%02x.%x\n",
+              (UINT32)gBus, (UINT32)gDev, (UINT32)gFn);
+    } else if (!u40x_find_gpu()) {
         Print(L"[50HX] GPU not found; abort\n");
         return returnToGrub ? EFI_SUCCESS : EFI_NOT_FOUND;
     }
