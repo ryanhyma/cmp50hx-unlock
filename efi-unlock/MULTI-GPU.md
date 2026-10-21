@@ -16,11 +16,11 @@ A malformed or repeated `--bdf` option is rejected with
 discovery-only chainload fails, its EFI error status is returned to firmware
 after it is logged.
 
-This is a discovery and explicit single-card selection change. Sequential
-multi-card unlock is intentionally not enabled yet: the current source does
-not provide a proven per-card cleanup boundary, and reusing the large unlock
-routine in a loop could leave a failed GPU or retained EFI allocation
-contaminating the next card. Do not pass a multi-card option; none exists.
+`--all` is an explicit, fail-stop sequential mode. It requires exactly eight
+discovered CMP 50HX devices, snapshots those BDFs, preloads the OS loader once,
+performs an EFI memory-capacity preflight, and then invokes the per-card worker
+in BDF discovery order. It does not select P104 devices. `--all` cannot be
+combined with `--discover-only` or `--bdf`; conflicting modes are rejected.
 
 ## Single-GPU state and lifetime review
 
@@ -43,13 +43,15 @@ contaminating the next card. Do not pass a multi-card option; none exists.
 No persistent BAR MMIO mapping object is used: accesses dereference `gBar0Base`
 plus an offset. This still makes `gBar0Base` a critical per-card selector.
 
-## Same-boot safety decision
+## Same-boot safety design
 
-The current one-card procedure is **not yet established as safe to run eight
-times in one EFI execution**, so this revision does not add `--all`. The
-successful test reported for this branch proves discovery-only enumeration
-and Ubuntu chainloading; it does not exercise a second unlock, allocation
-retention across several unlocked GPUs, or partial failure recovery.
+The worker retains its firmware allocations through Ubuntu handoff. This is
+intentional: the source does not establish when an unlocked GPU ceases to
+reference any particular payload. `--all` therefore never frees or reuses a
+card's retained pages, never issues FLR, and stops on the first failed or
+uncertain worker result. The current hardware evidence proves discovery-only
+enumeration and Ubuntu chainloading; the staged unlock procedure below remains
+required before treating eight-card operation as hardware-validated.
 
 The memory lifetime is material. `alloc_fwsec_buffer()` and
 `alloc_below_4g()` request `EfiReservedMemoryType` pages. The one-card path
@@ -72,33 +74,26 @@ not called by the release flow. Adding FLR as inter-card cleanup would
 therefore introduce an unverified state change. Do not reset an earlier
 unlocked card to prepare the next one.
 
-There is another required separation: the existing `done` path calls
-`u40x_rebar_try()` for BAR1. An `--all` path must explicitly skip that block
-to honor the no-ReBAR requirement, while the historical single-card path
-must retain its behavior. It must also preload the OS loader once and
-chainload only after the final card; invoking the current entry once per card
-would delete/reopen the log and chainload too early.
+The coordinator retains the historical ReBAR behavior only for a successful
+single-card/default invocation. `--all` explicitly skips it. The coordinator
+preloads the OS loader once and chainloads only after the final worker returns.
 
-## Safe architecture before enabling `--all`
+## Implemented architecture
 
-Keep `efi_main()` as a coordinator. It should validate mutually exclusive
-modes, discover and snapshot the selected BDF list once, and preload the OS
-loader once. Extract the existing BAR-through-verification sequence into an
-`unlock_one(BDF)` worker that returns its per-card result without chainloading.
-Before each worker, reset all card-scoped globals to known defaults, bind that
-card's BDF and BAR0, and detect its own framebuffer/WPR geometry. The worker
-must use only that card's GSP/SEC2 reset sequence; it must not issue FLR or
-touch another card's root port.
+`efi_main()` validates mutually exclusive modes, discovers and snapshots the
+target BDF list once, preloads once, coordinates results, and chainloads once.
+`unlock_one_gpu(const CMP50_BDF *, CMP50_UNLOCK_CONTEXT *,
+CMP50_UNLOCK_RESULT *)` binds a fresh context before each run, resets the
+active BDF/BAR/WPR globals to defaults, detects that card's framebuffer/WPR
+geometry, and returns without chainloading or ReBAR changes. The result stores
+the EFI status, SS0, SS1, and an independent verification flag.
 
-Track every allocated page and its owner for diagnostics, but retain all
-pages through the final Ubuntu `StartImage` unless hardware/source evidence
-proves a specific allocation is no longer referenced. Report SS0 and SS1 as
-separate readbacks for each BDF, continue to another BDF only when the failed
-card's current operations have returned safely, skip ReBAR in `--all`, write
-an aggregate summary, then chainload once. Before hardware use, check that
-the EFI memory map can satisfy the retained allocation budget; allocation
-failure must stop further writes cleanly without reclaiming pages from cards
-already processed.
+Each allocation records physical address, page count, EFI type, purpose,
+owning context, and the conservative `gpuMayReference` lifetime flag. The
+capacity preflight counts EFI conventional-memory pages against the retained
+per-card working-set estimate. Each worker logs BDF, SS0, SS1, result, and
+retained KiB. The coordinator emits an aggregate attempted/success/retained
+summary and fail-stops after a worker failure.
 
 Validation should progress from the known-working `02:00.0` through two
 cards, then four, then all eight, using BootNext each time. Confirm both
