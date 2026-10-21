@@ -9,6 +9,7 @@ for token in (
     "CMP50_UNLOCK_RESULT",
     "cmp50_preflight_capacity",
     'u40x_has_load_option(ImageHandle, L"--all")',
+    "parse_all_count",
     "result->ss0 == VAL_SS0_UNLOCKED",
     "result->ss1 == VAL_SS1_UNLOCKED",
     "fail-stop",

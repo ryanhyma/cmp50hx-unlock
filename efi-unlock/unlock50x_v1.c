@@ -4425,6 +4425,39 @@ static INTN parse_selected_bdf(EFI_HANDLE IH, CMP50_BDF *out)
     return result;
 }
 
+/* Optional staged --all limit: only accepted with --all and limited to 1..8. */
+static INTN parse_all_count(EFI_HANDLE IH, UINTN *out)
+{
+    EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
+    const CHAR16 *o;
+    UINTN i, chars, start, len;
+    INTN result = 0;
+    if (!IH || EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, IH,
+            &u40x_li_guid, (VOID **)&li)) || !li || !li->LoadOptions)
+        return 0;
+    o = (const CHAR16 *)li->LoadOptions;
+    chars = li->LoadOptionsSize / sizeof(CHAR16);
+    for (i = 0; i < chars && o[i];) {
+        while (i < chars && o[i] && (o[i] == L' ' || o[i] == L'\t' ||
+               o[i] == L'\r' || o[i] == L'\n')) i++;
+        start = i;
+        while (i < chars && o[i] && o[i] != L' ' && o[i] != L'\t' &&
+               o[i] != L'\r' && o[i] != L'\n') i++;
+        len = i - start;
+        if (len < 7 || o[start] != L'-' || o[start + 1] != L'-' ||
+            (o[start + 2] | 0x20) != L'c' || (o[start + 3] | 0x20) != L'o' ||
+            (o[start + 4] | 0x20) != L'u' || (o[start + 5] | 0x20) != L'n' ||
+            (o[start + 6] | 0x20) != L't')
+            continue;
+        if (result || len != 9 || o[start + 7] != L'=' ||
+            o[start + 8] < L'1' || o[start + 8] > L'8')
+            return -1;
+        *out = (UINTN)(o[start + 8] - L'0');
+        result = 1;
+    }
+    return result;
+}
+
 /* BAR0 decode + command|=MEMORY|BUS_MASTER（黑盒 prepare_pci_resources 简化版） */
 static int u40x_enable_bar(void)
 {
@@ -5094,7 +5127,8 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     CMP50_UNLOCK_CONTEXT contexts[CMP50_MAX_TARGETS];
     CMP50_UNLOCK_RESULT results[CMP50_MAX_TARGETS];
     BOOLEAN discoveryOnly, allMode, returnToGrub;
-    INTN bdfOption;
+    INTN bdfOption, countOption;
+    UINTN allCount = CMP50_MAX_TARGETS;
     UINTN foundCount, targetCount = 0, i, ok = 0;
     UINT64 totalRetained = 0;
     EFI_STATUS st = EFI_SUCCESS;
@@ -5114,8 +5148,9 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     allMode = u40x_has_load_option(ImageHandle, L"--all");
     g_multiGpuMode = allMode;
     bdfOption = parse_selected_bdf(ImageHandle, &selected);
-    if (bdfOption < 0 || (discoveryOnly && (allMode || bdfOption)) ||
-        (allMode && bdfOption)) {
+    countOption = parse_all_count(ImageHandle, &allCount);
+    if (bdfOption < 0 || countOption < 0 || (discoveryOnly && (allMode || bdfOption || countOption)) ||
+        (allMode && bdfOption) || (!allMode && countOption)) {
         Print(L"[50HX] conflicting or malformed selection options\n");
         return EFI_INVALID_PARAMETER;
     }
@@ -5132,13 +5167,13 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         return st;
     }
     if (allMode) {
-        if (foundCount != 8) {
-            Print(L"[50HX] --all requires exactly 8 CMP 50HX devices; found %d\n",
+        if (foundCount != 8 || allCount > foundCount) {
+            Print(L"[50HX] --all requires 8 CMP 50HX devices; found %d\n",
                   (INTN)foundCount);
             return EFI_NOT_FOUND;
         }
-        CopyMem(targets, found, sizeof(CMP50_BDF) * foundCount);
-        targetCount = foundCount;
+        CopyMem(targets, found, sizeof(CMP50_BDF) * allCount);
+        targetCount = allCount;
     } else if (bdfOption == 1) {
         for (i = 0; i < foundCount; i++)
             if (found[i].bus == selected.bus && found[i].dev == selected.dev &&

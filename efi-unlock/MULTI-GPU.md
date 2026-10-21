@@ -21,6 +21,9 @@ discovered CMP 50HX devices, snapshots those BDFs, preloads the OS loader once,
 performs an EFI memory-capacity preflight, and then invokes the per-card worker
 in BDF discovery order. It does not select P104 devices. `--all` cannot be
 combined with `--discover-only` or `--bdf`; conflicting modes are rejected.
+For staged hardware work, `--all --count=1`, `--all --count=2`,
+`--all --count=4`, and `--all --count=8` select the first discovered one,
+two, four, or eight snapshot BDFs. `--count` is rejected outside `--all`.
 
 ## Single-GPU state and lifetime review
 
