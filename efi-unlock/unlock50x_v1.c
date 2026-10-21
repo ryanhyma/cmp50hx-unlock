@@ -24,6 +24,10 @@
  *     from a loaded app hard-hangs whole firmware families.
  *   - optional --return-to-grub load option skips that ladder and returns
  *     EFI_SUCCESS to the caller, allowing GRUB to chainload the OS next.
+ *   - --discover-only enumerates CMP 50HX devices without PCI/MMIO writes;
+ *   - --bdf=BB:DD.F selects one discovered CMP 50HX explicitly.
+ *   - --all snapshots eight CMP 50HX BDFs, retains per-card firmware pages,
+ *     fail-stops on an uncertain result, and chainloads once after the run.
  *
  * Unlock protocol is unchanged (ported from open-gpu-kernel-modules
  * 610.43.03 init flow, proved on hardware by the 40HX project):
@@ -682,6 +686,70 @@ static EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *gRb = NULL;
 static UINTN gBus = 0, gDev = 0, gFn = 0;
 static UINT32 gBar0Base = 0;
 
+#define CMP50_MAX_FOUND 64
+#define CMP50_MAX_TARGETS 8
+#define CMP50_MAX_ALLOCS 12
+typedef struct { UINT8 bus, dev, fn; } CMP50_BDF;
+typedef struct {
+    CMP50_BDF owner;
+    EFI_PHYSICAL_ADDRESS phys;
+    UINTN pages;
+    EFI_MEMORY_TYPE type;
+    const CHAR16 *purpose;
+    BOOLEAN gpuMayReference;
+} CMP50_ALLOCATION;
+typedef struct {
+    CMP50_BDF bdf;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *rootBridge;
+    UINT32 bar0;
+    UINT64 fbSize, frtsOffset;
+    UINT32 wpr2LoUp, wpr2HiUp, wpr2LoPreKill, wpr2HiPreKill;
+    UINT64 lowMetaPhys;
+    CMP50_ALLOCATION allocations[CMP50_MAX_ALLOCS];
+    UINTN allocationCount;
+    UINT64 retainedBytes;
+    BOOLEAN allocationExhausted;
+} CMP50_UNLOCK_CONTEXT;
+typedef struct {
+    EFI_STATUS status;
+    UINT32 ss0, ss1;
+    BOOLEAN verified;
+} CMP50_UNLOCK_RESULT;
+static CMP50_UNLOCK_CONTEXT *g_unlockCtx = NULL;
+static const CHAR16 *g_allocPurpose = L"firmware buffer";
+static BOOLEAN g_multiGpuMode = FALSE;
+
+/* Reserve a ledger entry before touching EFI memory.  Firmware pages remain
+ * owned by this GPU through handoff, even when the following stage fails. */
+static EFI_STATUS
+cmp50_prepare_allocation(UINTN pages)
+{
+    if (!g_unlockCtx) return EFI_SUCCESS;
+    if (g_unlockCtx->allocationCount >= CMP50_MAX_ALLOCS) {
+        g_unlockCtx->allocationExhausted = TRUE;
+        Print(L"[50HX] BDF=%02x:%02x.%x allocation ledger exhausted before %lu pages\n",
+              (UINT32)g_unlockCtx->bdf.bus, (UINT32)g_unlockCtx->bdf.dev,
+              (UINT32)g_unlockCtx->bdf.fn, pages);
+        return EFI_OUT_OF_RESOURCES;
+    }
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS
+cmp50_record_allocation(EFI_PHYSICAL_ADDRESS phys, UINTN pages)
+{
+    CMP50_ALLOCATION *a;
+    if (!g_unlockCtx) return EFI_SUCCESS;
+    if (g_unlockCtx->allocationCount >= CMP50_MAX_ALLOCS)
+        return EFI_OUT_OF_RESOURCES; /* protected by cmp50_prepare_allocation */
+    a = &g_unlockCtx->allocations[g_unlockCtx->allocationCount++];
+    a->owner = g_unlockCtx->bdf;
+    a->phys = phys; a->pages = pages; a->type = EfiReservedMemoryType;
+    a->purpose = g_allocPurpose; a->gpuMayReference = TRUE;
+    g_unlockCtx->retainedBytes += (UINT64)pages << 12;
+    return EFI_SUCCESS;
+}
+
 /* v1.50: WPR2 state captured before the GFW engine reset (step [7.6]),
  * used by step [8b] to decide whether the manual FWSEC boot is needed. */
 static EFI_HANDLE g_IH = NULL;   /* real image handle under the crt0 entry */
@@ -1015,10 +1083,27 @@ find_bridge_to(UINTN target_bus, UINTN *ob, UINTN *od, UINTN *of)
 static EFI_STATUS
 alloc_below_4g(UINTN Pages, EFI_PHYSICAL_ADDRESS *Phys)
 {
+    EFI_STATUS st;
+    st = cmp50_prepare_allocation(Pages);
+    if (EFI_ERROR(st)) return st;
     *Phys = 0xFFFFFFFFULL;
-    return uefi_call_wrapper(BS->AllocatePages, 4, AllocateMaxAddress,
-                             EfiReservedMemoryType, Pages, Phys);
+    st = uefi_call_wrapper(BS->AllocatePages, 4, AllocateMaxAddress,
+                           EfiReservedMemoryType, Pages, Phys);
+    if (!EFI_ERROR(st)) st = cmp50_record_allocation(*Phys, Pages);
+    return st;
 }
+
+/* A per-run state audit for multi-card work: gRb, gBus/gDev/gFn and
+ * gBar0Base identify the active card and must be rebound before every run;
+ * g_fbSize/g_frtsOffset/g_wpr2LoUp/g_wpr2HiUp and the pre-kill WPR2 pair
+ * are card firmware state and must be reset/re-detected for every card.
+ * cmp90_next_high_slot is allocator state shared by all payload allocations;
+ * cmp90_metaLowPhys caches a single low page; g_ryzenApu and the root bridge
+ * array describe host topology and may be shared. Payload addresses in
+ * efi_main are local, but AllocatePages keeps their pages reserved until
+ * explicitly freed or EFI exit. Logging and chainload buffers are app-wide.
+ * These lifetimes are why discovery/selection is separated from writes and
+ * why a multi-card unlock loop needs per-card cleanup before it is enabled. */
 
 /* v2.62: буфер FWSEC ВЫШЕ 4ГБ — драйвер грузит с 0x110BB0000 (>4GB,
  * memdesc NV_MEMORY_CACHED). Наш ниже-4ГБ (0x7FB15000) — единственное
@@ -1034,6 +1119,8 @@ alloc_fwsec_buffer(UINTN Pages, EFI_PHYSICAL_ADDRESS *Phys)
      * WPR meta/V67 из sysmem — из <4ГБ чтение блокировано (exit 0x91)! */
     EFI_STATUS st;
     UINTN i;
+    st = cmp50_prepare_allocation(Pages);
+    if (EFI_ERROR(st)) return st;
     for (i = 0; i < 12; i++) {
         *Phys = cmp90_next_high_slot + i * 0x1000000ULL;
         st = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAddress,
@@ -1041,7 +1128,7 @@ alloc_fwsec_buffer(UINTN Pages, EFI_PHYSICAL_ADDRESS *Phys)
         if (!EFI_ERROR(st)) {
             cmp90_next_high_slot = *Phys + ((UINT64)Pages << 12) + 0x1000000ULL;
             Print(L"alloc_high: OK @0x%lx (%d pages)\n", *Phys, (UINT32)Pages);
-            return EFI_SUCCESS;
+            goto allocated;
         }
     }
     {
@@ -1053,12 +1140,18 @@ alloc_fwsec_buffer(UINTN Pages, EFI_PHYSICAL_ADDRESS *Phys)
             if (!EFI_ERROR(uefi_call_wrapper(BS->AllocatePages, 4, AllocateAddress,
                                              EfiReservedMemoryType, Pages, Phys))) {
                 Print(L"alloc_high: OK (static) @0x%lx\n", *Phys);
-                return EFI_SUCCESS;
+                goto allocated;
             }
         }
     }
+    if (g_multiGpuMode) {
+        Print(L"alloc_high: above 4GB failed; --all refuses below-4GB fallback\n");
+        return EFI_OUT_OF_RESOURCES;
+    }
     Print(L"alloc_high: above 4GB failed - falling back below 4GB\n");
     return alloc_below_4g(Pages, Phys);
+allocated:
+    return cmp50_record_allocation(*Phys, Pages);
 }
 
 /* Включить MEM_EN + BUS_MASTER в command-регистре GPU.
@@ -1630,28 +1723,30 @@ static UINT64 cmp90_metaLowPhys = 0;
 static UINT64
 cmp90_meta_low(UINT64 wprMetaPhys)
 {
-    if (cmp90_metaLowPhys == 0) {
-        if (EFI_ERROR(alloc_below_4g(1, &cmp90_metaLowPhys))) {
+    UINT64 *metaPhys = g_unlockCtx ? &g_unlockCtx->lowMetaPhys : &cmp90_metaLowPhys;
+    if (*metaPhys == 0) {
+        g_allocPurpose = L"low WPR metadata mirror";
+        if (EFI_ERROR(alloc_below_4g(1, metaPhys))) {
             Print(L"meta-low: alloc FAIL - using original\n");
             return wprMetaPhys;
         }
     }
-    CopyMem((VOID*)(UINTN)cmp90_metaLowPhys,
+    CopyMem((VOID*)(UINTN)*metaPhys,
             (VOID*)(UINTN)wprMetaPhys, WPR_META_SIZE);
     __asm__ volatile("wbinvd" ::: "memory");
     {
         /* v2.64: верификация контента — magic + heap + sig + flags */
-        UINT64 *m = (UINT64*)(UINTN)cmp90_metaLowPhys;
+        UINT64 *m = (UINT64*)(UINTN)*metaPhys;
         /* поля: [9]=sigAddr [10]=sigSize [15]=heapOff [16]=heapSize
          * [17]=gspFwOffset [19]=frtsOff [20]=frtsSize; flags @байт 0xB4 */
         Print(L"meta-low @0x%lx: magic ok=%d sig@0x%llx sz=0x%llx "
               L"heapOff=0x%llx heapSz=0x%llx fwOff=0x%llx flags=0x%x\n",
-              cmp90_metaLowPhys,
+              *metaPhys,
               (m[0] == 0xDC3AAE21371A60B3ULL),
               m[9], m[10], m[15], m[16], m[17],
-              *(UINT32*)((UINT8*)cmp90_metaLowPhys + 0xB4));
+              *(UINT32*)((UINT8*)(UINTN)*metaPhys + 0xB4));
     }
-    return cmp90_metaLowPhys;
+    return *metaPhys;
 }
 
 /* ==================== v2.69: поллинг mbox0 ВО ВРЕМЯ исполнения ботера =====
@@ -4229,6 +4324,212 @@ diag_done: ;
     return 0;
 }
 
+/* Discovery uses read-only CF8/CFC config reads, the same path already used
+ * by the proven single-card probe. It never enables BARs or writes registers. */
+static UINTN discover_cmp50(CMP50_BDF *found, UINTN cap)
+{
+    UINTN b, d, f, n = 0;
+    for (b = 0; b < 256; b++) for (d = 0; d < 32; d++) {
+        UINT32 id0 = u40x_pci_rbdf(b, d, 0, 0, 2);
+        UINT32 hdr;
+        UINTN maxf;
+        if (id0 == 0xFFFFFFFFu || (id0 & 0xFFFFu) == 0) continue;
+        hdr = u40x_pci_rbdf(b, d, 0, 0x0C, 2);
+        maxf = (hdr & 0x800000u) ? 8 : 1;
+        for (f = 0; f < maxf; f++) {
+            UINT32 id = f ? u40x_pci_rbdf(b, d, f, 0, 2) : id0;
+            if ((id & 0xFFFFu) != 0x10DEu || (id >> 16) != 0x1E09u)
+                continue;
+            Print(L"[50HX] discovery CMP 50HX %02x:%02x.%x 10de:1e09\n",
+                  (UINT32)b, (UINT32)d, (UINT32)f);
+            if (n < cap) { found[n].bus = b; found[n].dev = d; found[n].fn = f; }
+            n++;
+        }
+    }
+    return n;
+}
+
+static BOOLEAN cmp50_high_range_is_free(EFI_MEMORY_DESCRIPTOR *map, UINTN mapSize,
+                                        UINTN descSize, UINT64 addr, UINTN pages)
+{
+    UINTN i;
+    UINT64 bytes = (UINT64)pages << 12;
+    for (i = 0; i < mapSize; i += descSize) {
+        EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)map + i);
+        UINT64 end = d->PhysicalStart + (d->NumberOfPages << 12);
+        if (d->Type == EfiConventionalMemory && addr >= 0x100000000ULL &&
+            addr >= d->PhysicalStart && addr + bytes >= addr && addr + bytes <= end)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static UINTN cmp50_radix_pages(void)
+{
+    UINT64 data = 0x1bfadc8ULL;
+    UINT64 nData = (data + 0xFFF) >> 12;
+    UINT64 nL2 = ((nData - 1) >> 9) + 1;
+    return (UINTN)(((data + ((2 + nL2) << 12) + 0xFFF) >> 12));
+}
+
+/* Preflight predicts the exact high-address allocator policy.  It is a
+ * conservative guard before writes, not a reservation: each allocation still
+ * validates and fails safely if firmware changes the map. */
+static EFI_STATUS cmp50_preflight_capacity(UINTN cards)
+{
+    UINTN mapSize = 0, key, descSize, i, card, spec, below4Pages = 0;
+    UINT32 descVersion;
+    EFI_MEMORY_DESCRIPTOR *map = NULL;
+    EFI_STATUS st;
+    UINT64 next = cmp90_next_high_slot;
+    const UINTN pages[] = {
+        (V67_SIZE + 0xFFF) >> 12, (BOOTER_UCODE_SIZE + 0xFFF) >> 12,
+        (GSP_RM_BOOT_SIZE + 0xFFF) >> 12, (0x1bfadc8ULL + 0xFFF) >> 12,
+        0, (WPR_META_SIZE + 0xFFF) >> 12, (FW50_BLOB_SIZE + 0xFFF) >> 12
+    };
+
+    st = uefi_call_wrapper(BS->GetMemoryMap, 5, &mapSize, map, &key,
+                           &descSize, &descVersion);
+    if (st != EFI_BUFFER_TOO_SMALL) return st;
+    mapSize += descSize * 8;
+    map = AllocatePool(mapSize);
+    if (!map) return EFI_OUT_OF_RESOURCES;
+    st = uefi_call_wrapper(BS->GetMemoryMap, 5, &mapSize, map, &key,
+                           &descSize, &descVersion);
+    if (!EFI_ERROR(st)) {
+        for (card = 0; card < cards && !EFI_ERROR(st); card++) {
+            for (spec = 0; spec < sizeof(pages) / sizeof(pages[0]); spec++) {
+                UINTN p = spec == 4 ? cmp50_radix_pages() : pages[spec];
+                BOOLEAN found = FALSE;
+                for (i = 0; i < 12; i++) {
+                    UINT64 candidate = next + i * 0x1000000ULL;
+                    if (cmp50_high_range_is_free(map, mapSize, descSize, candidate, p)) {
+                        next = candidate + ((UINT64)p << 12) + 0x1000000ULL;
+                        found = TRUE;
+                        break;
+                    }
+                }
+                if (!found) st = EFI_OUT_OF_RESOURCES;
+            }
+            below4Pages++; /* optional one-page metadata fallback per card */
+        }
+        for (i = 0; !EFI_ERROR(st) && i < mapSize; i += descSize) {
+            EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)map + i);
+            if (d->Type == EfiConventionalMemory &&
+                d->PhysicalStart < 0x100000000ULL)
+                below4Pages = below4Pages > (UINTN)d->NumberOfPages ?
+                    below4Pages - (UINTN)d->NumberOfPages : 0;
+        }
+        if (!EFI_ERROR(st) && below4Pages) st = EFI_OUT_OF_RESOURCES;
+    }
+    FreePool(map);
+    Print(L"[50HX] allocation preflight: cards=%lu high-address contiguous=%r\n",
+          cards, st);
+    return st;
+}
+
+static void cmp50_bind_context(CMP50_UNLOCK_CONTEXT *ctx, const CMP50_BDF *gpu)
+{
+    SetMem(ctx, sizeof(*ctx), 0);
+    ctx->bdf = *gpu;
+    ctx->fbSize = 0x280000000ULL;
+    ctx->frtsOffset = FW50_FRTS_OFFSET;
+    ctx->wpr2LoUp = FW50_WPR2_LO_UP;
+    ctx->wpr2HiUp = FW50_WPR2_HI_UP;
+    g_unlockCtx = ctx;
+    gRb = NULL; gBus = gpu->bus; gDev = gpu->dev; gFn = gpu->fn;
+    gBar0Base = 0;
+    gBrIdx = -1;
+    g_allocPurpose = L"firmware buffer";
+    g_fbSize = ctx->fbSize; g_frtsOffset = ctx->frtsOffset;
+    g_wpr2LoUp = ctx->wpr2LoUp; g_wpr2HiUp = ctx->wpr2HiUp;
+    g_Wpr2LoPreKill = 0; g_Wpr2HiPreKill = 0;
+}
+
+static INTN bdf_hex_digit(CHAR16 c)
+{
+    if (c >= L'0' && c <= L'9') return c - L'0';
+    c |= 0x20;
+    if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+    return -1;
+}
+
+/* 0 = option absent, 1 = one valid option, -1 = malformed or duplicated. */
+static INTN parse_selected_bdf(EFI_HANDLE IH, CMP50_BDF *out)
+{
+    EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
+    const CHAR16 *o;
+    UINTN i, chars, start, len;
+    INTN result = 0;
+    if (!IH || EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, IH,
+            &u40x_li_guid, (VOID **)&li)) || !li || !li->LoadOptions)
+        return 0;
+    o = (const CHAR16 *)li->LoadOptions;
+    chars = li->LoadOptionsSize / sizeof(CHAR16);
+    for (i = 0; i < chars && o[i];) {
+        while (i < chars && o[i] && (o[i] == L' ' || o[i] == L'\t' ||
+               o[i] == L'\r' || o[i] == L'\n')) i++;
+        start = i;
+        while (i < chars && o[i] && o[i] != L' ' && o[i] != L'\t' &&
+               o[i] != L'\r' && o[i] != L'\n') i++;
+        len = i - start;
+        if (len < 5 || o[start] != L'-' || o[start+1] != L'-' ||
+            (o[start+2] | 0x20) != L'b' ||
+            (o[start+3] | 0x20) != L'd' ||
+            (o[start+4] | 0x20) != L'f')
+            continue;
+        if (result || len != 13 || o[start+5] != L'=' ||
+            o[start+8] != L':' || o[start+11] != L'.' ||
+            o[start+12] < L'0' || o[start+12] > L'7')
+            return -1;
+        {
+            INTN b0 = bdf_hex_digit(o[start+6]);
+            INTN b1 = bdf_hex_digit(o[start+7]);
+            INTN d0 = bdf_hex_digit(o[start+9]);
+            INTN d1 = bdf_hex_digit(o[start+10]);
+            if (b0 < 0 || b1 < 0 || d0 < 0 || d1 < 0) return -1;
+            out->bus = (UINT8)(b0 * 16 + b1);
+            out->dev = (UINT8)(d0 * 16 + d1);
+            out->fn = (UINT8)(o[start+12] - L'0');
+        }
+        result = 1;
+    }
+    return result;
+}
+
+/* Optional staged --all limit: only accepted with --all and limited to 1..8. */
+static INTN parse_all_count(EFI_HANDLE IH, UINTN *out)
+{
+    EFI_LOADED_IMAGE_PROTOCOL *li = NULL;
+    const CHAR16 *o;
+    UINTN i, chars, start, len;
+    INTN result = 0;
+    if (!IH || EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, IH,
+            &u40x_li_guid, (VOID **)&li)) || !li || !li->LoadOptions)
+        return 0;
+    o = (const CHAR16 *)li->LoadOptions;
+    chars = li->LoadOptionsSize / sizeof(CHAR16);
+    for (i = 0; i < chars && o[i];) {
+        while (i < chars && o[i] && (o[i] == L' ' || o[i] == L'\t' ||
+               o[i] == L'\r' || o[i] == L'\n')) i++;
+        start = i;
+        while (i < chars && o[i] && o[i] != L' ' && o[i] != L'\t' &&
+               o[i] != L'\r' && o[i] != L'\n') i++;
+        len = i - start;
+        if (len < 7 || o[start] != L'-' || o[start + 1] != L'-' ||
+            (o[start + 2] | 0x20) != L'c' || (o[start + 3] | 0x20) != L'o' ||
+            (o[start + 4] | 0x20) != L'u' || (o[start + 5] | 0x20) != L'n' ||
+            (o[start + 6] | 0x20) != L't')
+            continue;
+        if (result || len != 9 || o[start + 7] != L'=' ||
+            o[start + 8] < L'1' || o[start + 8] > L'8')
+            return -1;
+        *out = (UINTN)(o[start + 8] - L'0');
+        result = 1;
+    }
+    return result;
+}
+
 /* BAR0 decode + command|=MEMORY|BUS_MASTER（黑盒 prepare_pci_resources 简化版） */
 static int u40x_enable_bar(void)
 {
@@ -4277,6 +4578,7 @@ static EFI_STATUS u40x_build_dummy_fw(UINT64 *dataPhys, UINT64 *dataSize)
      * verify meta layoutfailed → exit 0x91（4166-4169 comment语义）。 */
     UINT64 sz = 0x1bfadc8ULL;    /* 真 GSP-RM ELF 尺寸（log53/gsp_tu10x .fwimage） */
 
+    g_allocPurpose = L"dummy GSP firmware";
     st = alloc_fwsec_buffer((UINTN)((sz + 0xFFF) >> 12), dataPhys);
     if (EFI_ERROR(st)) {
         Print(L"[40HX fw] alloc dummy: %r\n", st);
@@ -4302,6 +4604,7 @@ static EFI_STATUS u40x_build_radix(UINT64 dataPhys, UINT64 dataSize,
     UINT64 i;
     EFI_STATUS st;
 
+    g_allocPurpose = L"radix table and firmware copy";
     st = alloc_fwsec_buffer((UINTN)((allocSz + 0xFFFu) >> 12), &tab);
     if (EFI_ERROR(st)) {
         Print(L"[40HX rt] alloc radix-table: %r\n", st);
@@ -4487,11 +4790,11 @@ u40x_rebar_try(UINT64 want, UINT32 selector)
 }
 
 /* ===== v55 主entry（DIRECT_SEC2，40HX） ===== */
-EFI_STATUS
-efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+static EFI_STATUS
+unlock_one_gpu(const CMP50_BDF *gpu, CMP50_UNLOCK_CONTEXT *ctx,
+               CMP50_UNLOCK_RESULT *result, EFI_HANDLE ImageHandle)
 {
     EFI_STATUS Status = EFI_SUCCESS;
-    BOOLEAN returnToGrub;
     UINT64 v67Phys = 0, v67LowPhys = 0;
     UINT64 ucodePhys = 0, blPhys = 0;
     UINT64 radixPhys = 0, radixTabPhys = 0, radixSize = 0;
@@ -4500,55 +4803,31 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     GspFwWprMeta *wprMeta = NULL;
     UINT32 boot0 = 0;
     UINTN i;
+    BOOLEAN barReady = FALSE;
 
-    InitializeLib(ImageHandle, SystemTable);
-    /* v1.50 (Linux build): with the stock crt0 entry the u40x_entry wrapper
-     * never runs, so open the ESP log here instead (same effect: all later
-     * Print output lands in \50hx_log.txt on our boot device). The gnu-efi
-     * ImageHandle global is also unset under crt0 (u40x_entry used to set
-     * it), so record the real handle for the VBIOS dumper as well. */
-    g_IH = ImageHandle;
-    /* issue #36: capture our loaded binary size for the chainload
-     * self-detection fallback. The Windows installer deploys our
-     * binary to two paths (\EFI\50HX\50HXUNLK.EFI + \EFI\Boot\bootx64.efi);
-     * a path-only "is this me" check misses the second copy and lets
-     * the chainload load it (which restarts the EFI = loop). */
-    {
-        EFI_LOADED_IMAGE *li0 = NULL;
-        if (!uefi_call_wrapper(BS->HandleProtocol, 3, ImageHandle,
-                &LoadedImageProtocol, (VOID**)&li0) && li0)
-            g_ourImageSize = (UINTN)li0->ImageSize;
-    }
-    u40x_open_log(ImageHandle);
-    Print(L"\n=== CMP50HX Unlock v1-50HX (TU102 GSP WITH_LOADER) ===\n");
-    returnToGrub = u40x_has_load_option(ImageHandle, L"--return-to-grub");
-    if (returnToGrub)
-        Print(L"[50HX] GRUB handoff mode: internal chainload disabled\n");
-    else
-        /* Read the OS loader into RAM BEFORE the unlock: the SFS fallback in
-         * chainload_preloaded() hangs on some AMI firmwares, so this is the
-         * path that must succeed. The call was lost when the 90HX branch was
-         * dropped (fffb5b9), which left every boot on the hangy fallback. */
-        preload_os_loader(ImageHandle);
-
-    /* ---------- [1] 找卡（黑盒 fast-probe + 有界） ---------- */
-    if (!u40x_find_gpu()) {
-        Print(L"[50HX] GPU not found; abort\n");
-        return returnToGrub ? EFI_SUCCESS : EFI_NOT_FOUND;
-    }
-
+    /* Coordinator owns EFI initialization, logging, discovery and handoff. */
+    if (!gpu || !ctx || !result) return EFI_INVALID_PARAMETER;
+    SetMem(result, sizeof(*result), 0);
+    cmp50_bind_context(ctx, gpu);
+    u40x_enc_found = 2;
+    Print(L"[50HX] BDF=%02x:%02x.%x worker BEGIN\n", (UINT32)gBus,
+          (UINT32)gDev, (UINT32)gFn);
     /* ---------- [2] BAR0 enable ---------- */
     if (u40x_enable_bar()) {
         Print(L"[50HX] BAR enable failed; abort\n");
-        return returnToGrub ? EFI_SUCCESS : EFI_DEVICE_ERROR;
+        Status = EFI_DEVICE_ERROR;
+        goto done;
     }
+    barReady = TRUE;
+    ctx->rootBridge = gRb;
     /* Detect the card SKU from the WPR2 the VBIOS POST latched (10 GiB vs 20 GiB).
      * Must happen before any code path that consumes g_fbSize / g_frtsOffset
      * (build_wpr_meta below, fwsec_boot_gsp_50hx in step [8b]). Cold POST with
      * no VBIOS FWSEC keeps the 10 GiB defaults — same fallback as before. */
     detect_fb_size(ImageHandle);
 #ifdef VBIOS_DUMP
-    u40x_vbios_dump();          /* v65: after BAR enable; -> \50hx_vbios.bin */
+    if (!g_multiGpuMode)
+        u40x_vbios_dump();      /* preserve single-card diagnostic behavior */
 #endif
 
     /* ---------- [3] BOOT0 芯片verify ---------- */
@@ -4586,6 +4865,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     set_gpu_time();
 
     /* ---------- [6] 载荷/ucode/BL allocate（>4G 高槽，与 unlock_v2 同policy） ---------- */
+    g_allocPurpose = L"V67 payload";
     Status = alloc_fwsec_buffer((V67_SIZE + 0xFFFu) >> 12, &v67Phys);
     if (EFI_ERROR(Status)) { Print(L"[50HX] alloc v67: %r\n", Status); goto done; }
     CopyMem((VOID *)(UINTN)v67Phys, v67_payload_bin, V67_SIZE);
@@ -4598,24 +4878,27 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     __asm__ volatile("wbinvd" ::: "memory");
     Print(L"[50HX] v67 payload @0x%lx (0x%x B, >4GB)\n", v67Phys, V67_SIZE);
 
+    g_allocPurpose = L"SEC2 booter ucode";
     Status = alloc_fwsec_buffer((BOOTER_UCODE_SIZE + 0xFFFu) >> 12, &ucodePhys);
     if (EFI_ERROR(Status)) { Print(L"[50HX] alloc ucode: %r\n", Status); goto done; }
     CopyMem((VOID *)(UINTN)ucodePhys, booter_ucode_prod, BOOTER_UCODE_SIZE);
     Print(L"[50HX] booter ucode @0x%lx (0x%x B, TU102 geom)\n",
           ucodePhys, BOOTER_UCODE_SIZE);
 
+    g_allocPurpose = L"GSP boot code";
     Status = alloc_fwsec_buffer((GSP_RM_BOOT_SIZE + 0xFFFu) >> 12, &blPhys);
     if (EFI_ERROR(Status)) { Print(L"[50HX] alloc bl: %r\n", Status); goto done; }
     CopyMem((VOID *)(UINTN)blPhys, gsp_rm_boot_dbg, GSP_RM_BOOT_SIZE);
 
     /* ---------- [7] dummy fw + radix-3 表 + WPR meta (fbSize=8GB) ---------- */
-    if (EFI_ERROR(u40x_build_dummy_fw(&fwPhys, &fwSize)))
-        goto done;
-    if (EFI_ERROR(u40x_build_radix(fwPhys, fwSize, &radixTabPhys)))
-        goto done;
+    Status = u40x_build_dummy_fw(&fwPhys, &fwSize);
+    if (EFI_ERROR(Status)) goto done;
+    Status = u40x_build_radix(fwPhys, fwSize, &radixTabPhys);
+    if (EFI_ERROR(Status)) goto done;
     radixPhys = radixTabPhys;
     radixSize = fwSize;
 
+    g_allocPurpose = L"WPR metadata";
     Status = alloc_fwsec_buffer((WPR_META_SIZE + 0xFFFu) >> 12, &wprMetaPhys);
     if (EFI_ERROR(Status)) { Print(L"[50HX] alloc meta: %r\n", Status); goto done; }
     wprMeta = (GspFwWprMeta *)(UINTN)wprMetaPhys;
@@ -4663,6 +4946,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
             Print(L"[50HX] SEC2 CPUCTL after BCR=0: 0x%08x\n", cpuctl);
         }
         if ((cpuctl & 0xBADF0000u) == 0xBADF0000u) {
+            Status = EFI_ACCESS_DENIED;
             Print(L"[50HX] SEC2 still locked — stop\n");
             goto done;
         }
@@ -4686,6 +4970,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         } else {
         if (g_Wpr2LoPreKill == g_wpr2LoUp)
             Print(L"[50HX fwsec50] WPR2 was up pre-kill but dropped — re-run FWSEC\n");
+        g_allocPurpose = L"FWSEC fallback";
         Status = alloc_fwsec_buffer((UINTN)((FW50_BLOB_SIZE + 0xFFFu) >> 12),
                                     &fwsecPhys);
         if (!EFI_ERROR(Status) && fwsecPhys) {
@@ -4792,28 +5077,133 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     Print(L"[gen2] not attempted pre-OS - OS-side Gen2 only (issue #25)\n");
 
 done:
-    dump_regs(L"[v55 final]");
-    /* ---------- [11] best-effort ReBAR (BAR1); reverts on any failed
-     * check — see u40x_rebar_try ---------- */
-    if (u40x_rebar32(ImageHandle)) {
-        Print(L"[rebar] rebar=32g: attempting 32 GiB BAR1 (issue #47)\n");
-        u40x_rebar_try(0x800000000ULL, 9U);
-    } else {
-        u40x_rebar_try(0x400000000ULL, 8U);
+    if (barReady) dump_regs(L"[v55 final]");
+    result->ss0 = barReady ? mmio_read32(REG_FEAT_OVR_SM_SPD) : 0;
+    result->ss1 = barReady ? mmio_read32(REG_FEAT_OVR_SM_SPD_1) : 0;
+    result->verified = barReady && result->ss0 == VAL_SS0_UNLOCKED &&
+                       result->ss1 == VAL_SS1_UNLOCKED;
+    if (!result->verified && !EFI_ERROR(Status)) Status = EFI_DEVICE_ERROR;
+    result->status = Status;
+    ctx->bar0 = gBar0Base;
+    ctx->fbSize = g_fbSize; ctx->frtsOffset = g_frtsOffset;
+    ctx->wpr2LoUp = g_wpr2LoUp; ctx->wpr2HiUp = g_wpr2HiUp;
+    ctx->wpr2LoPreKill = g_Wpr2LoPreKill; ctx->wpr2HiPreKill = g_Wpr2HiPreKill;
+    Print(L"[50HX] BDF=%02x:%02x.%x SS0=0x%08x SS1=0x%08x %s retained=%lu KiB\n",
+          (UINT32)gpu->bus, (UINT32)gpu->dev, (UINT32)gpu->fn,
+          result->ss0, result->ss1, result->verified ? L"SUCCESS" : L"FAIL",
+          ctx->retainedBytes >> 10);
+    g_unlockCtx = NULL;
+    return Status;
+}
+
+EFI_STATUS
+efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+{
+    CMP50_BDF found[CMP50_MAX_FOUND], selected, targets[CMP50_MAX_TARGETS];
+    CMP50_UNLOCK_CONTEXT contexts[CMP50_MAX_TARGETS];
+    CMP50_UNLOCK_RESULT results[CMP50_MAX_TARGETS];
+    BOOLEAN discoveryOnly, allMode, returnToGrub;
+    INTN bdfOption, countOption;
+    UINTN allCount = CMP50_MAX_TARGETS;
+    UINTN foundCount, targetCount = 0, i, ok = 0, attempted = 0;
+    UINT64 totalRetained = 0;
+    EFI_STATUS st = EFI_SUCCESS;
+
+    InitializeLib(ImageHandle, SystemTable);
+    g_IH = ImageHandle;
+    {
+        EFI_LOADED_IMAGE *li0 = NULL;
+        if (!uefi_call_wrapper(BS->HandleProtocol, 3, ImageHandle,
+                &LoadedImageProtocol, (VOID**)&li0) && li0)
+            g_ourImageSize = (UINTN)li0->ImageSize;
     }
-    /* v71fix: 黑屏很久+driver掉根因 = return firmware → BDS 重跑 POST →
-     * GPU 重新initialize/unlock 丢失。改用黑盒式链载（chainload_preloaded：
-     * preload loader → LoadImage → StartImage，мимо — возврат в BDS），
-     * 不回firmware、无第二 POST，SS0 保持、driver正常。 */
-    if (returnToGrub) {
-        Print(L"[50HX] returning to GRUB; it may now start the OS loader\n");
+    u40x_open_log(ImageHandle);
+    Print(L"\n=== CMP50HX Unlock multi-GPU coordinator ===\n");
+    returnToGrub = u40x_has_load_option(ImageHandle, L"--return-to-grub");
+    discoveryOnly = u40x_has_load_option(ImageHandle, L"--discover-only");
+    allMode = u40x_has_load_option(ImageHandle, L"--all");
+    g_multiGpuMode = allMode;
+    bdfOption = parse_selected_bdf(ImageHandle, &selected);
+    countOption = parse_all_count(ImageHandle, &allCount);
+    if (bdfOption < 0 || countOption < 0 || (discoveryOnly && (allMode || bdfOption || countOption)) ||
+        (allMode && bdfOption) || (!allMode && countOption)) {
+        Print(L"[50HX] conflicting or malformed selection options\n");
+        return EFI_INVALID_PARAMETER;
+    }
+    foundCount = discover_cmp50(found, CMP50_MAX_FOUND);
+    if (!foundCount || foundCount > CMP50_MAX_FOUND) return EFI_NOT_FOUND;
+    Print(L"[50HX] discovery complete: %d CMP 50HX card(s)\n", (INTN)foundCount);
+    if (discoveryOnly) {
+        Print(L"[50HX] discovery-only: no PCI or GPU firmware writes performed\n");
+        if (!returnToGrub) {
+            preload_os_loader(ImageHandle);
+            st = chainload_preloaded(ImageHandle);
+            Print(L"[50HX] discovery-only chainload result: %r\n", st);
+        }
+        return st;
+    }
+    if (allMode) {
+        if (foundCount != 8 || allCount > foundCount) {
+            Print(L"[50HX] --all requires 8 CMP 50HX devices; found %d\n",
+                  (INTN)foundCount);
+            return EFI_NOT_FOUND;
+        }
+        CopyMem(targets, found, sizeof(CMP50_BDF) * allCount);
+        targetCount = allCount;
+    } else if (bdfOption == 1) {
+        for (i = 0; i < foundCount; i++)
+            if (found[i].bus == selected.bus && found[i].dev == selected.dev &&
+                found[i].fn == selected.fn) break;
+        if (i == foundCount) return EFI_NOT_FOUND;
+        targets[targetCount++] = selected;
     } else {
-        EFI_STATUS cst = chainload_preloaded(ImageHandle);
-        Print(L"[50HX] chainload result: %r\n", cst);
-        if (EFI_ERROR(cst)) {
-            Print(L"[50HX] chainload failed - last resort return firmware\n");
+        /* Keep the historical first-card selection algorithm for default mode. */
+        if (!u40x_find_gpu()) return EFI_NOT_FOUND;
+        targets[targetCount].bus = (UINT8)gBus;
+        targets[targetCount].dev = (UINT8)gDev;
+        targets[targetCount++].fn = (UINT8)gFn;
+    }
+    if (!returnToGrub) preload_os_loader(ImageHandle);
+    if (allMode) {
+        st = cmp50_preflight_capacity(targetCount);
+        if (EFI_ERROR(st)) {
+            Print(L"[50HX] --all allocation preflight failed: %r; no GPU writes\n", st);
+            return st;
         }
     }
-    uefi_call_wrapper(BS->Stall, 1, 2000000);
-    return EFI_SUCCESS;
+    for (i = 0; i < targetCount; i++) {
+        Print(L"[50HX] GPU %d/%d BDF=%02x:%02x.%x BEGIN\n", (INTN)(i + 1),
+              (INTN)targetCount, targets[i].bus, targets[i].dev, targets[i].fn);
+        attempted++;
+        st = unlock_one_gpu(&targets[i], &contexts[i], &results[i], ImageHandle);
+        totalRetained += contexts[i].retainedBytes;
+        if (results[i].verified && !EFI_ERROR(st)) ok++;
+        else {
+            Print(L"[50HX] GPU %d/%d FAIL status=%r; fail-stop\n",
+                  (INTN)(i + 1), (INTN)targetCount, st);
+            break;
+        }
+    }
+    for (i = attempted; i < targetCount; i++) {
+        results[i].status = EFI_NOT_READY;
+        Print(L"[50HX] BDF=%02x:%02x.%x UNATTEMPTED (prior GPU failed)\n",
+              (UINT32)targets[i].bus, (UINT32)targets[i].dev, (UINT32)targets[i].fn);
+    }
+    Print(L"[50HX] summary: attempted=%d success=%d failed=%d unattempted=%d retained=%lu KiB%s\n",
+          (INTN)attempted, (INTN)ok, (INTN)(attempted - ok),
+          (INTN)(targetCount - attempted),
+          totalRetained >> 10,
+          allMode ? L" (ReBAR skipped)" : L"");
+    if (!allMode && ok == targetCount) {
+        if (u40x_rebar32(ImageHandle))
+            u40x_rebar_try(0x800000000ULL, 9U);
+        else
+            u40x_rebar_try(0x400000000ULL, 8U);
+    }
+    if (!returnToGrub) {
+        EFI_STATUS cst = chainload_preloaded(ImageHandle);
+        Print(L"[50HX] chainload result: %r\n", cst);
+        if (EFI_ERROR(cst)) return cst;
+    }
+    return ok == targetCount ? EFI_SUCCESS : EFI_DEVICE_ERROR;
 }
