@@ -43,6 +43,71 @@ contaminating the next card. Do not pass a multi-card option; none exists.
 No persistent BAR MMIO mapping object is used: accesses dereference `gBar0Base`
 plus an offset. This still makes `gBar0Base` a critical per-card selector.
 
+## Same-boot safety decision
+
+The current one-card procedure is **not yet established as safe to run eight
+times in one EFI execution**, so this revision does not add `--all`. The
+successful test reported for this branch proves discovery-only enumeration
+and Ubuntu chainloading; it does not exercise a second unlock, allocation
+retention across several unlocked GPUs, or partial failure recovery.
+
+The memory lifetime is material. `alloc_fwsec_buffer()` and
+`alloc_below_4g()` request `EfiReservedMemoryType` pages. The one-card path
+allocates a 29.4 MB (28 MiB) dummy firmware image (`0x1bfadc8`) and a
+separate radix allocation containing another copy of that image, then
+allocates the V67, booter ucode, GSP boot code, WPR metadata, and possibly
+FWSEC. There is no
+`FreePages` cleanup. The first two allocations alone retain about 58.7 MB
+(56 MiB) per card, or roughly 470 MB (448 MiB) for eight cards, through
+chainload; failed attempts can retain additional partial allocations. The
+code does not establish when the GPU has finished referencing every buffer,
+so freeing or reusing them
+while any card remains unlocked is not justified.
+
+The reset routines operate on the currently selected card through the global
+BAR0 base: the flow kills GSP firmware and resets/sanitizes SEC2. They are not
+a demonstrated full-device recovery contract for a card whose unlock fails.
+`do_flr()` is defined, and its own comment says FLR clears latched WPR2; it is
+not called by the release flow. Adding FLR as inter-card cleanup would
+therefore introduce an unverified state change. Do not reset an earlier
+unlocked card to prepare the next one.
+
+There is another required separation: the existing `done` path calls
+`u40x_rebar_try()` for BAR1. An `--all` path must explicitly skip that block
+to honor the no-ReBAR requirement, while the historical single-card path
+must retain its behavior. It must also preload the OS loader once and
+chainload only after the final card; invoking the current entry once per card
+would delete/reopen the log and chainload too early.
+
+## Safe architecture before enabling `--all`
+
+Keep `efi_main()` as a coordinator. It should validate mutually exclusive
+modes, discover and snapshot the selected BDF list once, and preload the OS
+loader once. Extract the existing BAR-through-verification sequence into an
+`unlock_one(BDF)` worker that returns its per-card result without chainloading.
+Before each worker, reset all card-scoped globals to known defaults, bind that
+card's BDF and BAR0, and detect its own framebuffer/WPR geometry. The worker
+must use only that card's GSP/SEC2 reset sequence; it must not issue FLR or
+touch another card's root port.
+
+Track every allocated page and its owner for diagnostics, but retain all
+pages through the final Ubuntu `StartImage` unless hardware/source evidence
+proves a specific allocation is no longer referenced. Report SS0 and SS1 as
+separate readbacks for each BDF, continue to another BDF only when the failed
+card's current operations have returned safely, skip ReBAR in `--all`, write
+an aggregate summary, then chainload once. Before hardware use, check that
+the EFI memory map can satisfy the retained allocation budget; allocation
+failure must stop further writes cleanly without reclaiming pages from cards
+already processed.
+
+Validation should progress from the known-working `02:00.0` through two
+cards, then four, then all eight, using BootNext each time. Confirm both
+readbacks for every card, all 18 GPUs in Ubuntu, unchanged Xid counts, and
+successful Ubuntu chainload after each step. A failed card requires a cold
+boot before another experiment unless a recovery sequence is independently
+proven. Until those steps pass, the single-card and discovery-only modes are
+the only supported write/diagnostic modes.
+
 ## Build
 
 On Ubuntu 24.04 with the repository GNU-EFI prerequisites installed:
