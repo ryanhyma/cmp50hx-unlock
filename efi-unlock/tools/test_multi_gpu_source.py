@@ -20,5 +20,8 @@ for token in (
 
 # The all-card coordinator must intentionally omit ReBAR from the worker.
 worker = source[source.index("unlock_one_gpu("):source.index("EFI_STATUS\nefi_main")]
-assert "#if 0 /* coordinator owns ReBAR policy and chainload */" in worker
+assert "#if 0" not in worker
+assert "cmp50_prepare_allocation" in source
+assert "cmp50_record_allocation" in source
+assert "--all refuses below-4GB fallback" in source
 print("multi-GPU source guardrails: OK")

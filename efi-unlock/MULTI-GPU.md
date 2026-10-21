@@ -34,7 +34,7 @@ two, four, or eight snapshot BDFs. `--count` is rejected outside `--all`.
 | `g_fbSize`, `g_frtsOffset`, `g_wpr2LoUp/g_wpr2HiUp` | Global firmware geometry. `detect_fb_size()` changes them; reset to defaults and detect per card. |
 | `g_Wpr2LoPreKill/g_Wpr2HiPreKill` | Global snapshot from before GFW reset; reset and recapture per card. |
 | `cmp90_next_high_slot` | Global monotonic address cursor used by `alloc_fwsec_buffer()`. Payload pages use `AllocatePages` and remain reserved through application exit unless explicitly freed. |
-| `cmp90_metaLowPhys` | Global cached below-4-GiB page. It is allocated once and reused; it must be tracked and not be mistaken for card-local memory. |
+| `cmp90_metaLowPhys` | Legacy fallback only. Workers use `CMP50_UNLOCK_CONTEXT.lowMetaPhys`, so a low metadata mirror is separately retained and owned per GPU. |
 | `g_ryzenApu`, `gRbAll[]/gRbAllN/gBrIdx` | Host topology/probe state. These can be shared only while the host topology is unchanged; they are not GPU firmware state. |
 | `pcie_gen_fails`, `cmp90_stockSig`, `cmp90_skipMapper`, `cmp90_corruptMeta` | File-scope diagnostics/legacy switches. Reset or prove immutable before reuse. |
 | `g_bmBuf/g_bmSize/g_bmDp/g_bmPath`, `g_bootPathCnt` | OS-loader preload and chainload state, application-wide; load once, chainload once after all GPU operations. |
@@ -91,12 +91,17 @@ active BDF/BAR/WPR globals to defaults, detects that card's framebuffer/WPR
 geometry, and returns without chainloading or ReBAR changes. The result stores
 the EFI status, SS0, SS1, and an independent verification flag.
 
-Each allocation records physical address, page count, EFI type, purpose,
-owning context, and the conservative `gpuMayReference` lifetime flag. The
-capacity preflight counts EFI conventional-memory pages against the retained
-per-card working-set estimate. Each worker logs BDF, SS0, SS1, result, and
-retained KiB. The coordinator emits an aggregate attempted/success/retained
-summary and fail-stops after a worker failure.
+Each allocation reserves an available per-context ledger entry before EFI
+allocation, then records physical address, page count, EFI type, purpose,
+owning BDF, and the conservative `gpuMayReference` lifetime flag exactly once.
+Ledger exhaustion returns `EFI_OUT_OF_RESOURCES` before an allocation attempt.
+For `--all`, high-address payload allocation refuses the historical below-4-GiB
+fallback. The preflight checks the required 16-MiB-aligned high-address
+candidates and contiguous page ranges for every retained per-card buffer; it
+also requires enough below-4-GiB space for optional metadata mirrors. It is a
+guard, not a reservation, so each allocation remains independently checked.
+Each worker logs BDF, SS0, SS1, result, and retained KiB. The coordinator emits
+attempted/success/failed/unattempted totals and fail-stops after a worker failure.
 
 Validation should progress from the known-working `02:00.0` through two
 cards, then four, then all eight, using BootNext each time. Confirm both
@@ -140,10 +145,11 @@ boot and repeat one card at a time for `03:00.0`, `0D:00.0`, `10:00.0`,
 `11:00.0`, `12:00.0`, `14:00.0`, and `15:00.0`.
 
 A one-card-per-boot test proves selection and card compatibility; it does not
-prove sequential multi-card operation because GPU state resets on reboot. Do
-not attempt same-boot multi-card unlocking until the implementation adds
-per-card state reset, allocation tracking/freeing, per-BDF error isolation,
-and independent post-write verification, and passes discovery/build review.
+prove sequential multi-card operation because GPU state resets on reboot. Once
+each BDF has passed independently, use `--all --count=2`, then `--count=4`,
+then `--count=8`, each through a one-time BootNext entry. On any failure, use a
+cold boot before further experiments; the coordinator leaves subsequent cards
+unattempted and chainloads only once after logging the partial result.
 
 ## Rollback
 
@@ -160,8 +166,8 @@ BAR enable and unlock path. Default selection retains the historic first-card
 behavior. The code does not change NVIDIA driver files, P104 card config,
 VBIOS, PCIe generation, ReBAR, or clocks.
 
-The new discovery/parser path has not been run in UEFI hardware or QEMU, and
-the successful GNU-EFI build remains outstanding. The actual eight-card
-sequential unlock and per-operation error isolation are not implemented in
-this revision; do not treat this branch as satisfying the multi-card unlock
-requirement or deploy it for all-card unlocking.
+Discovery-only has been hardware-tested on the target B250 Mining Expert and
+successfully chainloaded Ubuntu. The multi-card write path has source-level
+mock coverage and brace/source checks, but no same-boot multi-GPU hardware
+validation and no GNU-EFI build are available in this development environment.
+Do not treat `--all` as hardware-proven until the staged procedure passes.
